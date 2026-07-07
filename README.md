@@ -1,4 +1,4 @@
-A simple 1 cpu core AI which learns to survive.
+# A simple 1 cpu core AI which learns to survive.
 
 2 modes:
 1. Watch live (reduces steps/s)
