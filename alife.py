@@ -26,7 +26,7 @@ DISH_W, DISH_H = 820, 680
 PANEL_W = 380
 W, H = DISH_W + PANEL_W, DISH_H
 
-IN, H1, H2, OUT = 12, 10, 6, 3
+IN, H1, H2, OUT = 15, 10, 6, 3   # +3 senses: danger intensity, safety dir x/y
 LAYER_SIZES = [IN, H1, H2, OUT]
 
 START_CELLS, MAX_CELLS, MIN_CELLS = 4, 8, 2
@@ -50,6 +50,26 @@ WALL_PEN = 0.015
 
 AUTOSAVE_STEPS = 1500
 
+# predators (scripted hunters — NOT learners) & toxic hazards
+PRED_START, PRED_MAX = 1, 2
+PRED_SPAWN_EVERY = 1400
+PRED_ACCEL, PRED_DRAG = 0.34, 0.14      # a touch slower than prey: a committed flee escapes
+PRED_R = 20.0
+PRED_BASE_COST = 0.00060
+PRED_BITE_RANGE = 8.0                    # membrane-to-membrane gap that counts as a bite
+PRED_BITE_DMG, PRED_BITE_GAIN = 0.12, 0.5
+PRED_BITE_CD = 40                        # can't melt a cell instantly
+
+HAZ_COUNT = 2
+HAZ_R_MIN, HAZ_R_MAX = 45, 70
+HAZ_DMG = 0.005
+
+# danger "smell": every predator/hazard is a Gaussian scent source
+DANGER_PRED_STR, DANGER_PRED_RNG = 1.0, 135.0
+DANGER_HAZ_STR = 0.8
+DANGER_PEN = 0.05                         # per-step fitness cost of sitting in danger
+BITE_PEN = 1.0                            # fitness cost per bite taken
+
 # muted palette (no neon)
 BG      = (17, 19, 25)
 DISH_RING = (34, 40, 50)
@@ -61,6 +81,14 @@ FOOD_LINE = (188, 205, 130)
 GRAN      = (176, 190, 180)      # cytoplasmic granules
 MITO      = (156, 138, 170)      # mitochondria (muted violet)
 NUCLEOLUS = (108, 118, 130)
+# predators / hazards / scent (warm & sickly, still muted — read as "other")
+PRED_BODY = (150, 96, 84)        # heliozoan body (muted brick)
+PRED_LINE = (206, 150, 130)      # axopod spines + membrane
+PRED_CORE = (110, 70, 62)
+HAZ_FILL  = (120, 120, 70)       # toxic bloom (sickly olive)
+HAZ_LINE  = (156, 156, 96)
+SCENT_PRED = (188, 132, 112)     # diffuse danger haze — predator
+SCENT_HAZ  = (150, 150, 92)      # diffuse danger haze — hazard
 
 CONS = "bcdfgklmnprstvwz"
 VOWS = "aeiou"
@@ -111,6 +139,7 @@ class Cell:
         self.stale = 0         # eval windows since the last improvement
         self.eaten = 0
         self.repro_cd = 0
+        self.pending_bite = 0.0   # bites taken since last brain tick (drives flee learning)
         self.phase = float(np.random.default_rng().uniform(0, 6.28))
         self.vacuoles = []     # {off:(dx,dy), digest:0..1}
         self.engulf = []       # {p0:(x,y), t:int}
@@ -131,6 +160,32 @@ class Cell:
         return (math.atan2(self.vel[1], self.vel[0]) if s > 1e-3 else 0.0), s
 
 
+# ------------------------- predators & hazards -------------------------
+class Predator:
+    """A predatory heliozoan. Scripted, not a learner: it chases the nearest
+    cell, bites for health damage, feeds, and starves if it can't catch anyone —
+    so it's an environmental pressure, never a rival species to evolve."""
+    def __init__(self, pos, rng, name):
+        self.pos = np.array(pos, np.float32)
+        self.vel = np.zeros(2, np.float32)
+        self.energy = 1.3
+        self.bite_cd = 0
+        self.name = name
+        self.phase = float(rng.uniform(0, 6.28))
+        self.spines = [(float(rng.uniform(0, 6.283)), float(rng.uniform(0.85, 1.25))) for _ in range(18)]
+
+
+class Hazard:
+    """A drifting toxic bloom: damages cells inside it, emits danger scent,
+    fades out after a while and respawns elsewhere so the dish keeps changing."""
+    def __init__(self, pos, radius, rng):
+        self.pos = np.array(pos, np.float32)
+        self.radius = float(radius)
+        self.life = 0
+        self.max_life = int(rng.uniform(1600, 2800))
+        self.blobs = [(float(rng.uniform(0, 6.283)), float(rng.uniform(0.5, 1.0))) for _ in range(10)]
+
+
 # ----------------------------- world -----------------------------
 class World:
     def __init__(self, seed=0):
@@ -142,6 +197,10 @@ class World:
         self.cells = [self._new_cell() for _ in range(START_CELLS)]
         self.food = [self._rand_pos() for _ in range(FOOD_CAP // 2)]
         self.waste_bits = []   # expelled poop {pos, t}
+        self.predators = []
+        self.hazards = []
+        for _ in range(HAZ_COUNT): self._spawn_hazard()
+        for _ in range(PRED_START): self._spawn_predator()
         self.focal = self.cells[0] if self.cells else None
 
     def _rand_pos(self):
@@ -167,6 +226,82 @@ class World:
         i = int(d.argmin())
         return i, float(d[i]), fa[i].copy()
 
+    # ---- danger "smell" field (analytic Gaussian sources) ----
+    def _danger_sources(self):
+        src = [(p.pos, DANGER_PRED_STR, DANGER_PRED_RNG) for p in self.predators]
+        src += [(h.pos, DANGER_HAZ_STR, h.radius + 60.0) for h in self.hazards]
+        return src
+
+    def danger_at(self, pos):
+        """Return (intensity 0..1, safety_x, safety_y) where safety is a unit
+        vector pointing away from danger — the gradient of the scent, flipped."""
+        D = gx = gy = 0.0
+        for sp, strg, rng in self._danger_sources():
+            dx = float(pos[0] - sp[0]); dy = float(pos[1] - sp[1])
+            r2 = rng * rng
+            g = strg * math.exp(-(dx * dx + dy * dy) / (2 * r2))
+            D += g
+            gx += g * (-dx / r2); gy += g * (-dy / r2)   # ∇D points toward the source
+        sx, sy = -gx, -gy                                  # safety = away from danger
+        n = math.hypot(sx, sy)
+        if n > 1e-9: sx /= n; sy /= n
+        else: sx = sy = 0.0
+        return min(1.0, D), sx, sy
+
+    def _spawn_predator(self):
+        side = int(self.rng.integers(0, 4))
+        if side == 0:   pos = [40, float(self.rng.uniform(40, DISH_H - 40))]
+        elif side == 1: pos = [DISH_W - 40, float(self.rng.uniform(40, DISH_H - 40))]
+        elif side == 2: pos = [float(self.rng.uniform(40, DISH_W - 40)), 40]
+        else:           pos = [float(self.rng.uniform(40, DISH_W - 40)), DISH_H - 40]
+        self.predators.append(Predator(pos, self.rng, make_name(self.rng)))
+
+    def _spawn_hazard(self):
+        r = float(self.rng.uniform(HAZ_R_MIN, HAZ_R_MAX))
+        self.hazards.append(Hazard(self._rand_pos(), r, self.rng))
+
+    def _update_hazards(self):
+        while len(self.hazards) < HAZ_COUNT: self._spawn_hazard()
+        for h in self.hazards[:]:
+            h.life += 1
+            h.pos += self.rng.uniform(-0.25, 0.25, 2).astype(np.float32)
+            h.pos[0] = np.clip(h.pos[0], 70, DISH_W - 70)
+            h.pos[1] = np.clip(h.pos[1], 70, DISH_H - 70)
+            for c in self.cells:
+                if np.hypot(*(c.pos - h.pos)) < h.radius:
+                    c.health -= HAZ_DMG
+            if h.life > h.max_life:
+                self.hazards.remove(h)
+
+    def _update_predators(self):
+        if self.steps % PRED_SPAWN_EVERY == 0 and len(self.predators) < PRED_MAX:
+            self._spawn_predator()
+        for p in self.predators[:]:
+            p.phase += 0.16
+            if p.bite_cd > 0: p.bite_cd -= 1
+            if self.cells:                                  # steer toward the nearest cell
+                tgt = min(self.cells, key=lambda c: (c.pos[0] - p.pos[0]) ** 2 + (c.pos[1] - p.pos[1]) ** 2)
+                v = tgt.pos - p.pos; d = float(np.hypot(*v)) + 1e-6
+                p.vel += (v / d) * PRED_ACCEL
+            else:
+                p.vel += self.rng.uniform(-0.1, 0.1, 2).astype(np.float32)
+            p.vel *= (1 - PRED_DRAG)
+            p.pos += p.vel
+            for ax, hi in ((0, DISH_W), (1, DISH_H)):
+                if p.pos[ax] < 40: p.pos[ax] = 40; p.vel[ax] *= -0.5
+                if p.pos[ax] > hi - 40: p.pos[ax] = hi - 40; p.vel[ax] *= -0.5
+            p.energy -= PRED_BASE_COST + 0.0004 * float(np.abs(p.vel).sum())
+            if p.bite_cd == 0:                              # bite the first cell in reach
+                for c in self.cells:
+                    if float(np.hypot(*(c.pos - p.pos))) - (c.radius + PRED_R) < PRED_BITE_RANGE:
+                        c.health -= PRED_BITE_DMG
+                        c.pending_bite += 1.0
+                        p.energy = min(2.0, p.energy + PRED_BITE_GAIN)
+                        p.bite_cd = PRED_BITE_CD
+                        break
+            if p.energy <= 0:                               # starved — pressure ebbs
+                self.predators.remove(p)
+
     def select_nearest(self, x, y):
         if not self.cells: return
         p = np.array([x, y], np.float32)
@@ -177,6 +312,10 @@ class World:
         self.steps += 1
         if self.steps % FOOD_SPAWN_EVERY == 0 and len(self.food) < FOOD_CAP:
             self.food.append(self._rand_pos())
+
+        # threats move first, so the cells sense (and are bitten by) fresh positions
+        self._update_hazards()
+        self._update_predators()
 
         for c in self.cells:
             c.age += 1
@@ -199,6 +338,10 @@ class World:
             x[9] = c.pos[1] / DISH_H * 2 - 1
             x[10] = np.clip(c.vel[0] / 5.0, -1, 1)  # which way am I drifting?
             x[11] = np.clip(c.vel[1] / 5.0, -1, 1)
+            danger, safe_x, safe_y = self.danger_at(c.pos)
+            x[12] = danger                          # how much danger do I smell?
+            x[13] = safe_x                          # which way is safety...
+            x[14] = safe_y                          # ...(gradient away from threats)
             a1, a2, o = forward(c.brain, x)
             move = np.tanh(o[:2]); excrete = sigmoid(o[2])
             if c is self.focal:
@@ -254,6 +397,10 @@ class World:
                 r += (dist_before - dist_after) * 0.02
             if ate: r += 3.0
             if at_wall: r -= WALL_PEN               # hugging the wall never pays
+            r -= DANGER_PEN * danger                # smelling danger is costly...
+            if c.pending_bite:                      # ...and getting bitten more so
+                r -= BITE_PEN * c.pending_bite
+                c.pending_bite = 0.0
             c.cur_fit += r
 
             # per-cell (1+1) evolution strategy: keep helpful tweaks, revert the rest
@@ -329,7 +476,11 @@ class World:
                 'cells': [{'pos': c.pos, 'vel': c.vel, 'energy': c.energy, 'health': c.health,
                            'waste': c.waste, 'age': c.age, 'name': c.name, 'hue': c.hue,
                            'eaten': c.eaten, 'brain': c.brain, 'best_brain': c.best_brain,
-                           'best_fit': c.best_fit} for c in self.cells]}
+                           'best_fit': c.best_fit} for c in self.cells],
+                'predators': [{'pos': p.pos, 'vel': p.vel, 'energy': p.energy,
+                               'bite_cd': p.bite_cd, 'name': p.name} for p in self.predators],
+                'hazards': [{'pos': h.pos, 'radius': h.radius, 'life': h.life,
+                             'max_life': h.max_life} for h in self.hazards]}
         with open(path, 'wb') as f: pickle.dump(blob, f)
         return len(self.cells)
 
@@ -360,6 +511,18 @@ class World:
             self.cells.append(c)
         self.steps = blob['steps']; self.births = blob['births']
         self.champ = migrate(blob.get('champ')); self.champ_fit = blob.get('champ_fit', 0.0)
+        self.predators = []
+        for d in blob.get('predators', []):
+            p = Predator(d['pos'], self.rng, d['name'])
+            p.vel = d['vel']; p.energy = d['energy']; p.bite_cd = d['bite_cd']
+            self.predators.append(p)
+        self.hazards = []
+        for d in blob.get('hazards', []):
+            h = Hazard(d['pos'], d['radius'], self.rng)
+            h.life = d['life']; h.max_life = d['max_life']
+            self.hazards.append(h)
+        while len(self.hazards) < HAZ_COUNT: self._spawn_hazard()
+        if not self.predators: self._spawn_predator()
         self.focal = self.cells[0] if self.cells else None
         return len(self.cells)
 
@@ -380,6 +543,68 @@ class Renderer:
             self.big = ImageFont.truetype("arialbd.ttf", 20)
         except Exception:
             self.f = self.s = self.big = ImageFont.load_default()
+        # soft radial sprite reused for every diffuse scent cloud
+        n = 200
+        yy, xx = np.mgrid[0:n, 0:n].astype(np.float32)
+        d = np.hypot(xx - (n - 1) / 2, yy - (n - 1) / 2) / ((n - 1) / 2)
+        self.scent = Image.fromarray((np.clip(1.0 - d, 0, 1) ** 1.7 * 255).astype(np.uint8), "L")
+
+    def _scent_overlay(self, wd):
+        """One transparent layer holding every threat's diffuse danger haze."""
+        ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+
+        def cloud(cx, cy, radius, color, max_a):
+            d = int(radius * 2)
+            if d < 4: return
+            alpha = self.scent.resize((d, d)).point(lambda v: int(v * max_a / 255))
+            ov.paste(Image.new("RGB", (d, d), color), (int(cx - radius), int(cy - radius)), alpha)
+
+        for h in wd.hazards:
+            cloud(h.pos[0], h.pos[1], (h.radius + 60) * 1.3, SCENT_HAZ, 60)
+        for p in wd.predators:
+            cloud(p.pos[0], p.pos[1], DANGER_PRED_RNG * 1.3, SCENT_PRED, 62)
+        return ov
+
+    def draw_hazard(self, dr, h):
+        cx, cy = float(h.pos[0]), float(h.pos[1])
+        fade = 1.0
+        if h.life < 120: fade = h.life / 120
+        elif h.life > h.max_life - 160: fade = max(0.0, (h.max_life - h.life) / 160)
+        pts = []
+        for i, (a0, amp) in enumerate(h.blobs):
+            a = 2 * math.pi * i / len(h.blobs)
+            rr = h.radius * (0.82 + 0.20 * amp * math.sin(2 * a + a0))
+            pts.append((cx + rr * math.cos(a), cy + rr * math.sin(a)))
+        dr.polygon(pts, fill=HAZ_FILL + (int(28 * fade),))
+        dr.line(pts + [pts[0]], fill=HAZ_LINE + (int(120 * fade),), width=1, joint="curve")
+        for k in range(9):                                   # toxic granules
+            a = k * 0.7 + h.life * 0.01
+            rr = h.radius * 0.6 * ((k % 3) / 3 + 0.2)
+            sx, sy = cx + math.cos(a) * rr, cy + math.sin(a) * rr
+            dr.ellipse((sx - 2, sy - 2, sx + 2, sy + 2), fill=HAZ_LINE + (int(150 * fade),))
+
+    def draw_predator(self, dr, p):
+        cx, cy = float(p.pos[0]), float(p.pos[1])
+        r = PRED_R
+        for ang, ln in p.spines:                             # radiating axopod spines
+            a = ang + 0.05 * math.sin(p.phase + ang * 3)
+            x0, y0 = cx + math.cos(a) * r * 0.9, cy + math.sin(a) * r * 0.9
+            x1, y1 = cx + math.cos(a) * r * 1.7 * ln, cy + math.sin(a) * r * 1.7 * ln
+            dr.line((x0, y0, x1, y1), fill=PRED_LINE + (150,), width=1)
+        pts = []
+        for i in range(36):
+            a = 2 * math.pi * i / 36
+            rr = r * (1 + 0.06 * math.sin(3 * a + p.phase))
+            pts.append((cx + rr * math.cos(a), cy + rr * math.sin(a)))
+        dr.polygon(pts, fill=PRED_BODY + (70,))
+        dr.line(pts + [pts[0]], fill=PRED_LINE + (230,), width=2, joint="curve")
+        dr.ellipse((cx - r * 0.42, cy - r * 0.42, cx + r * 0.42, cy + r * 0.42),
+                   fill=PRED_CORE + (150,), outline=PRED_LINE + (120,))
+        for k in range(3):
+            a = p.phase * 0.2 + k * 2.09
+            gx, gy = cx + math.cos(a) * r * 0.5, cy + math.sin(a) * r * 0.5
+            dr.ellipse((gx - 2, gy - 2, gx + 2, gy + 2), fill=PRED_CORE + (180,))
+        dr.text((cx - r, cy - r - 14), p.name, font=self.s, fill=PRED_LINE + (220,))
 
     def _membrane(self, cx, cy, r, heading, speed, phase, n=44):
         pts = []
@@ -475,14 +700,18 @@ class Renderer:
             lab(vx, vy, W - 26, cy + r * 0.55, "food vacuole", right=True)
 
     def render(self, wd: World, focal_forced=None):
-        img = Image.new("RGB", (W, H), BG)
+        img = Image.new("RGBA", (W, H), BG + (255,))
         dr = ImageDraw.Draw(img, "RGBA")
         # dish border
         dr.ellipse((10, 10, DISH_W - 10, DISH_H - 10), outline=DISH_RING, width=2)
-        # panel bg
-        dr.rectangle((DISH_W, 0, W, H), fill=(13, 15, 20))
-        dr.line((DISH_W, 0, DISH_W, H), fill=(40, 46, 56), width=1)
 
+        # diffuse danger scent (under everything in the dish)
+        img = Image.alpha_composite(img, self._scent_overlay(wd))
+        dr = ImageDraw.Draw(img, "RGBA")
+
+        # toxic hazards
+        for h in wd.hazards:
+            self.draw_hazard(dr, h)
         # food
         for f in wd.food:
             dr.ellipse((f[0] - 4, f[1] - 4, f[0] + 4, f[1] + 4), fill=FOOD_FILL + (220,), outline=FOOD_LINE + (255,))
@@ -491,6 +720,9 @@ class Renderer:
             a = max(0, 1 - wb['t'] / 120)
             p = wb['pos']
             dr.ellipse((p[0] - 3, p[1] - 3, p[0] + 3, p[1] + 3), fill=(150, 120, 90, int(160 * a)))
+        # predators
+        for p in wd.predators:
+            self.draw_predator(dr, p)
         # cells
         for c in wd.cells:
             self.draw_cell(dr, c, c.pos[0], c.pos[1], 1.0, label=True)
@@ -500,13 +732,17 @@ class Renderer:
             fx, fy = wd.focal.pos
             dr.ellipse((fx - r, fy - r, fx + r, fy + r), outline=(120, 200, 235, 180), width=2)
 
+        # panel bg (drawn last over the dish edge so scent never bleeds into it)
+        dr.rectangle((DISH_W, 0, W, H), fill=(13, 15, 20))
+        dr.line((DISH_W, 0, DISH_W, H), fill=(40, 46, 56), width=1)
         self._panel(dr, wd)
         self._hud(dr, wd)
-        return img
+        return img.convert("RGB")
 
     def _hud(self, dr, wd):
         spf = getattr(wd, "_spf", 1); fps = getattr(wd, "_fps", 0.0)
         dr.text((18, 16), f"step {wd.steps}   cells {len(wd.cells)}   births {wd.births}"
+                          f"   predators {len(wd.predators)}   hazards {len(wd.hazards)}"
                           f"   speed {spf}x  (~{int(spf * fps)} steps/s)",
                 font=self.s, fill=(150, 165, 178, 255))
         dr.text((18, DISH_H - 26),
@@ -526,10 +762,12 @@ class Renderer:
         dr.ellipse((pcx - 92, pcy - 92, pcx + 92, pcy + 92), outline=(40, 46, 56), width=1)
         self.draw_cell(dr, c, pcx, pcy, 2.3, label=False, diagram=True)
         # stat bars
+        threat = wd.danger_at(c.pos)[0]
         y = 260
         for lab, val, col in (("energy", c.energy / E_MAX, (110, 190, 120)),
                               ("health", c.health, (120, 170, 210)),
                               ("waste", c.waste, (200, 160, 120)),
+                              ("threat", threat, (200, 130, 110)),
                               ("learned", max(0.0, min(1.0, c.best_fit / 8.0)), (180, 180, 140))):
             dr.text((px + 20, y), lab, font=self.s, fill=(150, 160, 172, 255))
             dr.rectangle((px + 96, y + 2, px + PANEL_W - 24, y + 13), outline=(60, 66, 76), width=1)
@@ -537,7 +775,7 @@ class Renderer:
             dr.rectangle((px + 96, y + 2, px + 96 + wbar, y + 13), fill=col + (255,))
             y += 22
         # brain
-        self._brain(dr, c, top=370)
+        self._brain(dr, c, top=396)
 
     def _brain(self, dr, c, top):
         px = DISH_W
