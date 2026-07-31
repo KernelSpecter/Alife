@@ -1,9 +1,10 @@
-# A simple 1 cpu core AI which learns to survive.
+# A simple 1 CPU core AI which learns to survive.
 
-2 modes:
+## Two modes:
 1. Watch live (reduces steps/s)
 2. Run without display (increases steps/s)
 
-expected time to get results: 5-6 hrs of background running without live on a decent cpu
+expected time to get results: 8-10 hrs of background running without live mode on a decent CPU
 
-Feel free to make the code any better or give new ideas
+
+# Accepting forks if I see any interesting ideas.
